@@ -78,40 +78,44 @@ jobs:
           import hashlib, json, sys
           from pathlib import Path
 
-          expected = "2d305387f61808d8d18e2cbb8ff627dc7948a08f37f4b75e6852dc29cdc6de9d"
+          # 规则必须与冻结时的实现逐字一致，否则外人算出另一个根，然后怀疑包被改过。
+          # 实测（2026-11-26，家机）：把文件摘要的字节直接当叶子、按 path 排序后成对哈希
+          # 得到 2d305387…；若改成 sha256(path\0摘要) 会得到 662ba5a7…，与非期望值差得远。
+          EXPECTED = "2d305387f61808d8d18e2cbb8ff627dc7948a08f37f4b75e6852dc29cdc6de9d"
 
-          def leaf(path, sha):
-              return hashlib.sha256((path + "\x00" + sha).encode()).digest()
-
-          def merkle(leaves):
-              level = leaves
-              while len(level) > 1:
-                  nxt = []
-                  for i in range(0, len(level), 2):
-                      a = level[i]
-                      b = level[i + 1] if i + 1 < len(level) else a
-                      nxt.append(hashlib.sha256(a + b).digest())
-                  level = nxt
-              return level[0].hex()
+          def merkle(hs):
+              hs = list(hs)
+              while len(hs) > 1:
+                  hs = [hashlib.sha256(hs[i] + (hs[i + 1] if i + 1 < len(hs) else hs[i])).digest()
+                        for i in range(0, len(hs), 2)]
+              return hs[0].hex()
 
           man = json.load(open("MANIFEST.json", encoding="utf-8"))
-          bad, leaves = [], []
-          for e in man["leaves"]:
-              p = Path(e["path"])
+          rows = man.get("files") or man.get("leaves") or []
+          bad, good = [], []
+          for e in rows:
+              # 仓内按 archive_path 存放（dataset/…、snapshot/…）；旧包可能只有 path
+              p = Path(e.get("archive_path") or e["path"])
               if not p.is_file():
-                  bad.append(p.as_posix() + " 不存在")
+                  p = Path(e["path"])
+              if not p.is_file():
+                  bad.append((e.get("archive_path") or e["path"]) + " 不存在")
                   continue
               got = hashlib.sha256(p.read_bytes()).hexdigest()
               if got != e["sha256"]:
                   bad.append("%s 变了：%s… ≠ %s…" % (p.as_posix(), got[:12], e["sha256"][:12]))
                   continue
-              leaves.append(leaf(e["path"], got))
+              good.append((e["path"], e["sha256"]))
           if bad:
               sys.exit("冻结集合被改动，拒绝发布：\n  " + "\n  ".join(bad))
-          root = merkle(leaves)
-          print("叶子 %d 个，复算根 %s" % (len(leaves), root))
-          if root != expected:
-              sys.exit("复算根与期望根不一致：%s ≠ %s" % (root, expected))
+          if len(good) != man.get("leaf_count", len(good)):
+              sys.exit("叶子数 %d ≠ manifest 声明的 %s" % (len(good), man.get("leaf_count")))
+          root = merkle([bytes.fromhex(d) for _, d in sorted(good)])
+          print("叶子 %d 个，复算根 %s" % (len(good), root))
+          if root != EXPECTED:
+              sys.exit("复算根与期望根不一致：%s ≠ %s" % (root, EXPECTED))
+          if man.get("merkle_root") and man["merkle_root"] != EXPECTED:
+              sys.exit("manifest 自称的根与期望根不一致")
           print("根一致")
           PY
 
@@ -136,14 +140,36 @@ jobs:
           fi
           ls -l "$ARCHIVE"
           python3 - "$ARCHIVE" <<'PY'
-          import sys, zipfile
+          import hashlib, json, sys, zipfile
           archive = sys.argv[1]
+          EXPECTED = "2d305387f61808d8d18e2cbb8ff627dc7948a08f37f4b75e6852dc29cdc6de9d"
           with zipfile.ZipFile(archive) as z:
               names = z.namelist()
-          for must in ("MANIFEST.json", "ROOT.txt", "DATASET_CARD.md", "bench.py"):
-              if not any(n.endswith(must) for n in names):
-                  sys.exit("档案缺 %s，拒绝发布" % must)
-          print("档案自检通过：%d 个文件，含 MANIFEST / ROOT / DATASET_CARD / bench.py" % len(names))
+              for must in ("MANIFEST.json", "ROOT.txt"):
+                  if must not in names:
+                      sys.exit("档案缺 %s：包里不带清单，外人无法复算，拒绝发布" % must)
+              man = json.loads(z.read("MANIFEST.json"))
+              rows = man.get("files") or man.get("leaves") or []
+              bad = []
+              for e in rows:
+                  ap = e.get("archive_path")
+                  if not ap or ap not in names:
+                      bad.append((e["path"], "包内无对应路径"))
+                      continue
+                  if hashlib.sha256(z.read(ap)).hexdigest() != e["sha256"]:
+                      bad.append((ap, "包内摘要不符"))
+              if bad:
+                  sys.exit("包内逐字节校验失败：%r" % (bad[:4],))
+              hs = [bytes.fromhex(e["sha256"]) for _, e in sorted((e["path"], e) for e in rows)]
+              while len(hs) > 1:
+                  hs = [hashlib.sha256(hs[i] + (hs[i + 1] if i + 1 < len(hs) else hs[i])).digest()
+                        for i in range(0, len(hs), 2)]
+              root = hs[0].hex()
+          print("档案自检通过：%d 条目，%d 叶子，由包内文件复算根 %s" % (len(names), len(rows), root))
+          if root != EXPECTED:
+              sys.exit("由包内文件复算的根 %s ≠ 期望 %s" % (root, EXPECTED))
+          if root != (man.get("merkle_root") or ""):
+              sys.exit("包内 manifest 自称的根与复算根不一致")
           PY
 
       - name: 新建记录并发布（dry_run 时停在草稿）
