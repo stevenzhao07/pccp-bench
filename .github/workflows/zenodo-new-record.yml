@@ -1,0 +1,253 @@
+name: Zenodo New Record
+
+# 用途：给这个仓库开一条**全新的** Zenodo 记录（新的 concept DOI），并把 tag 上的冻结包上传。
+#
+# 为什么不复用 sfc 仓库那条 zenodo-deposit.yml
+# ------------------------------------------
+# 那条流程做的是"在既有 concept DOI 下加一个版本"（POST /actions/newversion）。
+# PCCP-Bench 还没有 concept DOI，它要的是 POST /deposit/depositions 新建一条。
+# 两条不能混用（Zenodo 文档明确：加版本与新建是两件事），所以单独写一条。
+#
+# 从 sfc 那条流程继承的九条教训（都踩过，不是预防性提醒）
+# ----------------------------------------------------
+# 1. 版本从 tag 读，不硬编码 —— 硬编码会让"发版"对流程不可见，档案自称旧版本号。
+# 2. release 事件跑的是 tag 上那份 workflow，不是 main 上的；tag 不可改，所以补发只能
+#    workflow_dispatch + 在 main 上跑 + 把 tag 当输入。
+# 3. 元数据来自 .zenodo.json，只注入 version；两处写版本就是两个真源。
+# 4. 上传后校验 HTTP 状态再 publish，publish 不可逆。
+# 5. 档案自检"我是不是自称的那个版本"，不是假设。
+# 6. 幂等：同版本已发布就 no-op，未发布的草稿先丢弃。
+# 7. 空 body（204）与 HTML 错误页不能当 JSON 解析。
+# 8. 上传前不假设草稿里没有继承文件（新建记录确实没有，但保留检查以免将来改成加版本）。
+# 9. 发布后断言记录自称的版本与文件名，不一致让 job 失败。
+#
+# 这条流程多一道 PCCP 专用闸
+# ------------------------
+# 发布前复算 MANIFEST.json 的 Merkle 根，与 EXPECTED_ROOT 比对；根不对就不上传。
+# 冻结集合改过一个字节，DOI 就指向了别的东西。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的版本，例如 0.1.0（tag v0.1.0 必须已存在）"
+        required: true
+        type: string
+      dry_run:
+        description: "只校验、不发布（true/false）"
+        required: false
+        default: "false"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_ROOT: 2d305387f61808d8d18e2cbb8ff627dc7948a08f37f4b75e6852dc29cdc6de9d
+
+jobs:
+  deposit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 解析版本（必须来自 vX.Y.Z 的 tag）
+        id: v
+        env:
+          IN_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          raw="${IN_VERSION:-$REF_NAME}"
+          ver="${raw#v}"
+          case "$ver" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::拒绝发布：'$raw' 不是 vX.Y.Z"; exit 1 ;;
+          esac
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: 检出 tag（档案必须是 tag 上那份，不能是分支）
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: refs/tags/v${{ steps.v.outputs.version }}
+
+      - name: 复算冻结根，与声明的期望根比对
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          python3 - "$VERSION" 2>/dev/null <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+
+          expected = "2d305387f61808d8d18e2cbb8ff627dc7948a08f37f4b75e6852dc29cdc6de9d"
+
+          def leaf(path, sha):
+              return hashlib.sha256((path + "\x00" + sha).encode()).digest()
+
+          def merkle(leaves):
+              level = leaves
+              while len(level) > 1:
+                  nxt = []
+                  for i in range(0, len(level), 2):
+                      a = level[i]
+                      b = level[i + 1] if i + 1 < len(level) else a
+                      nxt.append(hashlib.sha256(a + b).digest())
+                  level = nxt
+              return level[0].hex()
+
+          man = json.load(open("MANIFEST.json", encoding="utf-8"))
+          bad, leaves = [], []
+          for e in man["leaves"]:
+              p = Path(e["path"])
+              if not p.is_file():
+                  bad.append(p.as_posix() + " 不存在")
+                  continue
+              got = hashlib.sha256(p.read_bytes()).hexdigest()
+              if got != e["sha256"]:
+                  bad.append("%s 变了：%s… ≠ %s…" % (p.as_posix(), got[:12], e["sha256"][:12]))
+                  continue
+              leaves.append(leaf(e["path"], got))
+          if bad:
+              sys.exit("冻结集合被改动，拒绝发布：\n  " + "\n  ".join(bad))
+          root = merkle(leaves)
+          print("叶子 %d 个，复算根 %s" % (len(leaves), root))
+          if root != expected:
+              sys.exit("复算根与期望根不一致：%s ≠ %s" % (root, expected))
+          print("根一致")
+          PY
+
+      - name: 打包含 tag 内所有文件，并自检档案内容
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -eu
+          ARCHIVE="pccp-bench_zenodo_v${VERSION}.zip"
+          if [ -f "$ARCHIVE" ]; then
+            echo "使用 tag 上已冻结的档案（不重新打包）"
+          else
+            python3 - "$VERSION" <<'PY'
+          import pathlib, sys, zipfile
+          ver = sys.argv[1]
+          out = "pccp-bench_zenodo_v%s.zip" % ver
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(pathlib.Path(".").rglob("*")):
+                  if p.is_file() and not str(p).startswith("."):
+                      z.write(p, p.as_posix())
+          PY
+          fi
+          ls -l "$ARCHIVE"
+          python3 - "$ARCHIVE" <<'PY'
+          import sys, zipfile
+          archive = sys.argv[1]
+          with zipfile.ZipFile(archive) as z:
+              names = z.namelist()
+          for must in ("MANIFEST.json", "ROOT.txt", "DATASET_CARD.md", "bench.py"):
+              if not any(n.endswith(must) for n in names):
+                  sys.exit("档案缺 %s，拒绝发布" % must)
+          print("档案自检通过：%d 个文件，含 MANIFEST / ROOT / DATASET_CARD / bench.py" % len(names))
+          PY
+
+      - name: 新建记录并发布（dry_run 时停在草稿）
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+          DRY: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+
+          TOKEN = os.environ.get("ZENODO_TOKEN", "")
+          if not TOKEN:
+              sys.exit("没有 ZENODO_TOKEN secret：仓库 Settings → Secrets 加一条，值用 Zenodo personal access token")
+          VERSION = os.environ["VERSION"]
+          DRY = (os.environ.get("DRY") or "false").lower() == "true"
+          API = "https://zenodo.org/api/deposit/depositions"
+          ARCHIVE = "pccp-bench_zenodo_v%s.zip" % VERSION
+
+          def body(raw, binary):
+              if binary:
+                  return raw
+              text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+              if not text.strip():
+                  return None
+              try:
+                  return json.loads(text)
+              except ValueError:
+                  return text
+
+          def call(method, url, payload=None, raw=False, ctype="application/json"):
+              h = {"Authorization": "Bearer " + TOKEN}
+              data = None
+              if payload is not None:
+                  h["Content-Type"] = ctype
+                  data = payload if raw else json.dumps(payload).encode()
+              req = urllib.request.Request(url, data=data, headers=h, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=180) as r:
+                      return r.status, body(r.read(), raw)
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode("utf-8", "replace")
+              except urllib.error.URLError as e:
+                  sys.exit("Zenodo 不可达：%s" % e)
+
+          meta = json.load(open(".zenodo.json", encoding="utf-8"))
+          meta["version"] = VERSION
+
+          # 幂等：本人账号下已有同标题同版本的记录，就不再新建
+          status, rows = call("GET", API + "?size=100&sort=mostrecent")
+          if status != 200:
+              sys.exit("token 被拒或 Zenodo 不可达（HTTP %s）：%.200s" % (status, rows))
+          if isinstance(rows, list):
+              for d in rows:
+                  m = d.get("metadata") or {}
+                  same_ver = str(m.get("version")) == VERSION
+                  same_title = (m.get("title") or "").startswith("PCCP-Bench")
+                  if not (same_ver and same_title):
+                      continue
+                  if d.get("submitted"):
+                      print("已有同版本记录 %s（DOI %s）—— 不重复新建" % (d["id"], d.get("doi")))
+                      sys.exit(0)
+                  print("发现同版本草稿 %s，先丢弃" % d["id"])
+                  call("POST", "%s/%s/actions/discard" % (API, d["id"]))
+
+          status, dep = call("POST", API, payload={"metadata": meta})
+          if status not in (200, 201) or not isinstance(dep, dict):
+              sys.exit("新建记录失败（HTTP %s）：%.300s" % (status, dep))
+          dep_id = dep["id"]
+          bucket = (dep.get("links") or {}).get("bucket") or ""
+          if not bucket:
+              sys.exit("新记录没有上传 bucket")
+          print("新建草稿 %s" % dep_id)
+
+          with open(ARCHIVE, "rb") as fh:
+              blob = fh.read()
+          status, up = call("PUT", "%s/%s" % (bucket, ARCHIVE), payload=blob, raw=True,
+                            ctype="application/octet-stream")
+          if status not in (200, 201):
+              sys.exit("上传 %s 失败（HTTP %s）：%.300s" % (ARCHIVE, status, up))
+          print("已上传 %s（%d 字节，HTTP %s）" % (ARCHIVE, len(blob), status))
+
+          status, _ = call("PUT", "%s/%s" % (API, dep_id), payload={"metadata": meta})
+          if status != 200:
+              sys.exit("写元数据失败（HTTP %s）" % status)
+          print("元数据已写入")
+
+          if DRY:
+              print("dry_run：停在草稿 %s，去 Zenodo 预览后再决定是否 Publish" % dep_id)
+              sys.exit(0)
+
+          status, pub = call("POST", "%s/%s/actions/publish" % (API, dep_id))
+          if status != 202 or not isinstance(pub, dict):
+              sys.exit("发布失败（HTTP %s）：%.300s" % (status, pub))
+          got = (pub.get("metadata") or {}).get("version")
+          names = [f.get("filename") for f in (pub.get("files") or [])]
+          print("record  DOI :", pub.get("doi"))
+          print("concept DOI :", pub.get("conceptdoi"))
+          print("record 版本 :", got)
+          print("记录文件   :", names)
+          if got != VERSION:
+              sys.exit("记录自称 %r，tag 是 %r" % (got, VERSION))
+          if names != [ARCHIVE]:
+              sys.exit("记录带的是 %r，期望恰好 %r" % (names, [ARCHIVE]))
+          print("OK —— DOI 已铸，档案与版本对得上")
+          PY
