@@ -1,0 +1,39 @@
+{
+  "title": "PCCP-Bench v0.1.0 — a judgeable, re-runnable test set for Predetermined Change Control Plan decisions in imaging AI",
+  "upload_type": "dataset",
+  "description": "<p><b>What this is.</b> A 42-case test set (32 public, 10 committed-but-hidden) plus the reference judge, for the single question a Predetermined Change Control Plan (PCCP) has to answer per change: <i>go</i>, <i>hold</i>, or <i>reject</i>. Every case carries the regulatory text it rests on, so a third party can disagree on the merits rather than on the plumbing.</p><p><b>What it is not.</b> It is not a regulatory determination, not FDA-endorsed, and not a substitute for a reviewer. Ground truth was rebuilt by us from public FDA guidance and cleared 510(k) summaries; it is our reading, not an agency position.</p><p><b>How to use it.</b> Unzip, then <code>python bench.py --submit your_adapter.py</code>. Your adapter receives one case at a time and returns go/hold/reject with a reason. Scores are exact match, macro recall and a citation-tag score. The reference adapter scores 0.9688 exact on both public and masked columns; the null baseline \"always go\" scores 0.875 exact but only 0.5 macro recall — a set where the lazy answer wins on the headline number is a set that measures nothing, which is why macro recall is reported beside it.</p><p><b>Reproducibility.</b> The archive is frozen: <code>MANIFEST.json</code> lists the sha256 of all 14 leaves and <code>ROOT.txt</code> carries the Merkle root <code>2d305387f61808d8d18e2cbb8ff627dc7948a08f37f4b75e6852dc29cdc6de9d</code> (rule: leaf = sha256(path + NUL + file_sha256), pairs hashed together, odd node pairs with itself). Recompute it and you will get the same string, or the archive has been altered.</p><p><b>Known disagreements.</b> 2 of 42 cases (K260973-H1, K260973-N2) are scored <i>hold</i> by our reading and <i>reject</i> by the reference judge. They are published as disagreements rather than silently resolved, because a benchmark that hides its own split judgements is asking to be trusted instead of checked.</p><p><b>Status.</b> Version 0.1.0, 2026-11-26. The hidden 10 cases are committed by hash only and are not in this archive. Anyone is welcome to run it and publish their numbers; disagreement is the point.</p>",
+  "creators": [
+    {
+      "name": "Zhao, Xinghua",
+      "affiliation": "MedXpert (independent)"
+    }
+  ],
+  "keywords": [
+    "Predetermined Change Control Plan",
+    "PCCP",
+    "medical device software",
+    "imaging AI",
+    "regulatory science",
+    "benchmark",
+    "21 CFR 892.2055",
+    "reproducible evaluation"
+  ],
+  "license": "cc-by-4.0",
+  "access_right": "open",
+  "language": "eng",
+  "notes": "Code in this archive (bench.py, build_cases.py, judge_pccp.py) is additionally available under Apache-2.0; the dataset text is CC BY 4.0. Licence split is stated per file in LICENSE_STATUS.md.",
+  "related_identifiers": [
+    {
+      "relation": "isSupplementTo",
+      "identifier": "https://www.fda.gov/medical-devices/premarket-submissions-selecting-and-preparing-correct-submission/predetermined-change-control-plans",
+      "resource_type": "other"
+    },
+    {
+      "relation": "isCompiledFrom",
+      "identifier": "https://www.ecfr.gov/current/title-21/chapter-I/subchapter-H/part-892/subpart-B/section-892.2055",
+      "resource_type": "other"
+    }
+  ],
+  "version": "0.1.0",
+  "publication_date": "2026-11-26"
+}
